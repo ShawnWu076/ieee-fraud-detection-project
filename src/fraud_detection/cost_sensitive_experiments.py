@@ -12,19 +12,24 @@ from .metrics import compute_classification_metrics
 from .tree_preprocessing_v2 import fit_tree_preprocessor_v2, transform_tree_preprocessor_v2
 
 DEFAULT_TOP_FRACTIONS = (0.01, 0.03, 0.05)
-PRIMARY_METRIC = "precision_at_top_3pct"
-SECONDARY_METRICS = ("recall_at_top_3pct", "average_precision")
-DIAGNOSTIC_METRICS = ("precision_at_top_1pct", "precision_at_top_5pct", "roc_auc")
+PRIMARY_METRIC = "roc_auc"
+SECONDARY_METRICS = ("average_precision", "precision_at_top_3pct", "recall_at_top_3pct")
+DIAGNOSTIC_METRICS = ("precision_at_top_1pct", "precision_at_top_5pct")
 
 
 @dataclass
 class CostSensitiveDataBundle:
+    variant_label: str
+    add_missing_indicators: bool
+    add_group_amount_features: bool
     train_part: pd.DataFrame
     valid_part: pd.DataFrame
     x_train: pd.DataFrame
     x_valid: pd.DataFrame
     y_train: np.ndarray
     y_valid: np.ndarray
+    input_rows: int
+    full_train_rows: int
     sample_rows: int
     train_rows: int
     valid_rows: int
@@ -38,22 +43,28 @@ def prepare_cost_sensitive_data(
     sample_size: int | None = 80_000,
     random_state: int = 42,
     nrows: int | None = None,
+    *,
+    variant_label: str = "v2_full",
+    add_missing_indicators: bool = True,
+    add_group_amount_features: bool = True,
 ) -> CostSensitiveDataBundle:
     train_df, _ = load_merged_data_safe(nrows=nrows)
-    if sample_size is not None and sample_size < len(train_df):
-        train_df = _time_spaced_sample(train_df, sample_size=sample_size)
-
+    full_train_rows = int(len(train_df))
     train_part, valid_part = make_time_validation_split(train_df)
+    sampled_train_part = train_part
+    if sample_size is not None and sample_size < len(train_part):
+        sampled_train_part = _time_spaced_sample(train_part, sample_size=sample_size)
+
     artifacts = fit_tree_preprocessor_v2(
-        train_part,
-        add_missing_indicators=True,
-        add_group_amount_features=True,
+        sampled_train_part,
+        add_missing_indicators=add_missing_indicators,
+        add_group_amount_features=add_group_amount_features,
         drop_missing_threshold=0.999,
     )
 
-    x_train = transform_tree_preprocessor_v2(train_part, artifacts, impute_numeric=False)
+    x_train = transform_tree_preprocessor_v2(sampled_train_part, artifacts, impute_numeric=False)
     x_valid = transform_tree_preprocessor_v2(valid_part, artifacts, impute_numeric=False)
-    y_train = train_part["isFraud"].to_numpy()
+    y_train = sampled_train_part["isFraud"].to_numpy()
     y_valid = valid_part["isFraud"].to_numpy()
 
     positive_count = max(1, int(y_train.sum()))
@@ -61,14 +72,19 @@ def prepare_cost_sensitive_data(
     base_scale_pos_weight = negative_count / positive_count
 
     return CostSensitiveDataBundle(
-        train_part=train_part,
+        variant_label=variant_label,
+        add_missing_indicators=add_missing_indicators,
+        add_group_amount_features=add_group_amount_features,
+        train_part=sampled_train_part,
         valid_part=valid_part,
         x_train=x_train,
         x_valid=x_valid,
         y_train=y_train,
         y_valid=y_valid,
-        sample_rows=int(len(train_df)),
-        train_rows=int(len(train_part)),
+        input_rows=full_train_rows,
+        full_train_rows=int(len(train_part)),
+        sample_rows=int(len(sampled_train_part)),
+        train_rows=int(len(sampled_train_part)),
         valid_rows=int(len(valid_part)),
         fraud_rate_train=float(np.mean(y_train)),
         fraud_rate_valid=float(np.mean(y_valid)),
@@ -225,7 +241,13 @@ def run_named_configs(
 def build_run_summary(data_bundle: CostSensitiveDataBundle) -> pd.DataFrame:
     return pd.DataFrame(
         [
-            {"item": "sample_rows", "value": data_bundle.sample_rows},
+            {"item": "variant_label", "value": data_bundle.variant_label},
+            {"item": "uses_missing_flags", "value": data_bundle.add_missing_indicators},
+            {"item": "uses_group_amount_features", "value": data_bundle.add_group_amount_features},
+            {"item": "split_strategy", "value": "full_time_split_then_sample_train_only"},
+            {"item": "input_rows", "value": data_bundle.input_rows},
+            {"item": "full_train_rows", "value": data_bundle.full_train_rows},
+            {"item": "sampled_train_rows", "value": data_bundle.sample_rows},
             {"item": "train_rows", "value": data_bundle.train_rows},
             {"item": "validation_rows", "value": data_bundle.valid_rows},
             {"item": "train_fraud_rate", "value": data_bundle.fraud_rate_train},
